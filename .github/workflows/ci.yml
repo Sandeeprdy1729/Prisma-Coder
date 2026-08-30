@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff black
+      - run: ruff check prismacoder datasets benchmark training evaluation inference utils tests
+      - run: black --check prismacoder datasets benchmark training evaluation inference utils tests
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev,eval]"
+      - name: unit + dataset + benchmark + verification tests (no GPU/node/network)
+        run: pytest -m "not gpu and not node and not network" tests -q
+      - name: config dry-runs
+        run: |
+          python training/scripts/train_sft.py --config training/configs/qlora_3b.yaml --dry-run
+          python training/scripts/train_dpo.py --config training/configs/dpo_qlora.yaml --dry-run
+          python training/scripts/train_cpt.py --config training/configs/cpt.yaml --dry-run
+
+  smoke-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev,eval]"
+      - name: end-to-end PrismaForge + PrismaBench smoke (static verification mode)
+        run: |
+          python datasets/scripts/04_generate_synthetic.py --limit 60 --seed 20260830 --out datasets/synthetic
+          python datasets/scripts/05_augment.py --seed 20260830 --out datasets/synthetic
+          python datasets/scripts/06_verify_all.py --light-only
+          python datasets/scripts/07_split_dataset.py --seed 20260830
+          python datasets/scripts/08_finalize_dataset.py --tag ci
+          python benchmark/generator/generate_benchmark.py --scale 0.02 --seed 20260830
+          python benchmark/evaluator/make_dummy_submission.py --out benchmark/evaluator/dummy_submission.jsonl
+          python benchmark/evaluator/evaluate.py --submission benchmark/evaluator/dummy_submission.jsonl \
+              --model ci-dummy --out benchmark/leaderboard/ci_results.json
+          python benchmark/evaluator/leaderboard.py
+          python evaluation/error_analysis.py --results benchmark/leaderboard/ci_results.json
+      - name: contamination firewall check (canaries absent from training data)
+        run: |
+          python - <<'EOF'
+          from prismacoder.io_utils import read_jsonl, count_lines
+          canaries = ("PRISMABENCH-CANARY",)
+          for f in ("datasets/train.jsonl", "datasets/validation.jsonl", "datasets/test.jsonl"):
+              for rec in read_jsonl(f):
+                  blob = rec["task"]["instruction"] + rec["task"]["reference"]
+                  assert not any(c in blob for c in canaries), f"canary leaked into {f}"
+          print("firewall OK: no benchmark canaries in training splits")
+          EOF
+
+  node-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - name: full V1-V5 gates on a generated sample
+        run: |
+          python datasets/scripts/04_generate_synthetic.py --limit 3 --seed 7 --out /tmp/pool
+          python - <<'EOF'
+          import json, os
+          from prismacoder.io_utils import read_jsonl
+          from prismacoder.verification.sandbox import node_available
+          from prismacoder.verification.verifier import Verifier
+          node, _ = node_available()
+          if node is None:
+              print("node unavailable; skipping"); raise SystemExit(0)
+          rec = read_jsonl("/tmp/pool/synthetic_pool.jsonl")[0]
+          v = Verifier(timeout_seconds=600, gates=("V1_validate", "V2_generate", "V3_tsc", "V4_execute"))
+          res = v.verify(rec["task"]["context"]["schema"], {"artifact.ts": rec["task"]["reference"]})
+          print("gate result:", res.status, res.first_failing_gate, res.diagnostics[:3])
+          assert res.status in ("verified", "failed")  # gates must run to a verdict
+          EOF

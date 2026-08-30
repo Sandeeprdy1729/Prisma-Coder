@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Node (verification sandbox) ---
+node_modules/
+sandbox/
+*.tsbuildinfo
+
+# --- Data artifacts (large; rebuild via datasets/scripts/run_phase1.sh) ---
+datasets/raw/*
+datasets/processed/*
+datasets/synthetic/*
+datasets/verified/*
+datasets/splits/*
+!datasets/raw/.gitkeep
+!datasets/processed/.gitkeep
+!datasets/synthetic/.gitkeep
+!datasets/verified/.gitkeep
+!datasets/splits/.gitkeep
+
+# --- Training artifacts ---
+runs/
+checkpoints/
+*.safetensors
+*.gguf
+*.bin
+wandb/
+reports/
+
+# --- Benchmark build outputs (regenerate deterministically) ---
+benchmark/leaderboard/*.json
+!benchmark/leaderboard/.gitkeep
+
+# --- Env / secrets ---
+.env
+*.key
+huggingface_token.txt
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

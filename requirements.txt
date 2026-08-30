@@ -1,0 +1,9 @@
+# PrismaCoder core requirements (dataset pipeline + benchmark + evaluation CLI).
+# Heavy, optional stacks live in pyproject.toml extras:
+#   pip install -e ".[training]"  -> SFT/DPO/CPT training
+#   pip install -e ".[serve]"     -> FastAPI / Gradio inference
+#   pip install -e ".[hub]"       -> HuggingFace upload
+#   pip install -e ".[dev]"       -> pytest / ruff / black / mypy
+requests>=2.31
+PyYAML>=6.0
+tqdm>=4.66

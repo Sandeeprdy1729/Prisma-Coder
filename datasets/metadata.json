@@ -1,0 +1,43 @@
+{
+  "dataset": "PrismaForge",
+  "version": "smoke",
+  "built_at": "2026-08-30T11:29:35Z",
+  "builder_version": "1.0.0",
+  "records": {
+    "train": 38,
+    "validation": 1,
+    "test": 1
+  },
+  "dpo_pairs": 2,
+  "benchmark_dev_rows": 1,
+  "mixture_by_category": {
+    "T2_schema_edit": 13,
+    "T4_client_crud": 7,
+    "T6_nested_writes_txn": 4,
+    "T8_repo_completion": 4,
+    "T3_migration_plan": 3,
+    "T7_aggregations": 3,
+    "T9_bug_fix": 3,
+    "T10_cross_file": 2,
+    "T1_schema_greenfield": 1
+  },
+  "domains": {
+    "fintech_ledger": 10,
+    "lms": 7,
+    "ecommerce": 6,
+    "analytics": 4,
+    "cms": 4,
+    "logistics": 3,
+    "marketplace": 3,
+    "social": 1,
+    "saas_billing": 1,
+    "iot_telemetry": 1
+  },
+  "difficulties": {
+    "L1": 40
+  },
+  "invalid_records_skipped": 0,
+  "canonical_schema": "datasets/schema.json",
+  "license_policy": "permissive-only (MIT/Apache-2.0/BSD/ISC); copyleft excluded",
+  "verification_policy": "four-gate chain (validate/generate/tsc/execute/vitest)"
+}

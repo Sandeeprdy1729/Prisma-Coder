@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prismacoder"
+version = "1.0.0"
+description = "PrismaCoder: the first open-source Text-to-Prisma LLM project - PrismaForge dataset, PrismaBench benchmark, and the PrismaCoder-3B model."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "PrismaCoder Team" }]
+keywords = ["prisma", "text-to-code", "orm", "llm", "text-to-sql", "fine-tuning", "benchmark"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+    "requests>=2.31",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+eval = ["numpy>=1.26", "matplotlib>=3.8", "pandas>=2.1"]
+training = [
+    "torch>=2.3",
+    "transformers>=4.46",
+    "trl>=0.12",
+    "peft>=0.13",
+    "datasets>=3.0",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.44",
+    "sentencepiece>=0.2",
+    "tensorboard>=2.17",
+    "hf-transfer>=0.1",
+]
+serve = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "sse-starlette>=2.1", "gradio>=4.44", "pydantic>=2.8"]
+hub = ["huggingface-hub>=0.26"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "black>=24.8", "mypy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/prismacoder/PrismaCoder"
+Documentation = "https://github.com/prismacoder/PrismaCoder/tree/main/docs"
+Benchmark = "https://huggingface.co/datasets/prismacoder/PrismaBench"
+
+[tool.setuptools.packages.find]
+include = ["prismacoder*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["E501", "B008", "UP035", "UP006"]
+
+[tool.black]
+line-length = 110
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+no_strict_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu: requires CUDA hardware",
+    "network: requires internet access",
+    "node: requires Node.js >= 18.18 and the Prisma CLI",
+]
+
+[tool.coverage.run]
+source = ["prismacoder"]

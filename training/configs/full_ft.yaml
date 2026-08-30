@@ -1,0 +1,67 @@
+# PrismaCoder-3B - Full fine-tuning SFT (report Table 12.1 S1 exact row)
+# LR 1.5e-5; 3 epochs; bs 128; packing on; NEFTune alpha 5; bf16.
+# Requires 8x A100-80G (~6-10 h) or DeepSpeed ZeRO-3 on smaller clusters.
+run_name: prismacoder-3b-full-sft
+output_dir: runs/prismacoder-3b-full-sft
+seed: 20260830
+
+model:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  max_seq_length: 4096
+
+# no peft block -> full parameter training
+
+data:
+  train_file: datasets/train.jsonl
+  validation_file: datasets/validation.jsonl
+  prompt_column: task
+  format: chat
+  system_prompt: "You are PrismaCoder, an expert in the Prisma ORM. You write schema.prisma (PSL) and TypeScript Prisma Client code that compiles, validates, and executes correctly. Output only the requested artifact inside a fenced code block. Use Prisma v7 conventions."
+  packing: true
+  packing_strategy: wrapped
+  max_packed_seq_len: 4096
+  neftune_noise_alpha: 5
+  worker_count: 8
+
+training:
+  num_train_epochs: 3
+  learning_rate: 1.5e-5                # Table 12.1 S1
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8       # 8 GPUs x 2 x 8 = 128 global
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+  optim: adamw_torch_fused
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 250
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 3
+  report_to: [tensorboard]
+  dataloader_num_workers: 8
+  group_by_length: true
+  deepspeed: training/configs/deepspeed/zero3.json   # set to zero2.json for 8xA100
+
+generation_sanity:
+  enabled: true
+  every_steps: 500
+  num_examples: 2
+  max_new_tokens: 512
+  temperature: 0.2
+
+hub:
+  push_to_hub: false
+  repo_id: prismacoder/PrismaCoder-3B
+  private: true

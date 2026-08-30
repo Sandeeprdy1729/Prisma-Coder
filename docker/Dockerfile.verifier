@@ -1,0 +1,30 @@
+# Verifier sandbox image: Node 20 + Python, runs the V1-V5 gate chain as a
+# service. Used by docker-compose and by `VERIFY_DOCKER=1` host runs.
+#   docker build -f docker/Dockerfile.verifier -t prismacoder/verifier:latest .
+FROM node:20-bookworm-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3-pip \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sandbox
+
+# pre-install the pinned verification toolchain so gates run without network
+RUN npm install --no-audit --no-fund \
+        typescript@5.6.3 prisma@7.10.0 @prisma/client@7.10.0 \
+        vitest@2.1.8 tsx@4.19.2 @types/node@^22.10.0
+
+COPY docker/verifier/worker.py /app/worker.py
+COPY prismacoder /app/prismacoder
+RUN python3 -m pip install --break-system-packages requests
+
+ENV PRISMACODER_SANDBOX_CACHE=/sandbox/node_modules
+EXPOSE 9100
+
+WORKDIR /app
+CMD ["python3", "worker.py", "--port", "9100"]

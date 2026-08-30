@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/prismacoder/PrismaCoder/datasets/schema.json",
+  "title": "PrismaForge record",
+  "type": "object",
+  "required": [
+    "id",
+    "source",
+    "domain",
+    "task",
+    "verification",
+    "meta"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^(pf|pb)-"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "track",
+        "license"
+      ],
+      "properties": {
+        "track": {
+          "enum": [
+            "mined",
+            "synthetic",
+            "official",
+            "docs",
+            "augmented"
+          ]
+        },
+        "origin_repo": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string",
+          "description": "SPDX id; permissive allowlist only"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "provenance_hash": {
+          "type": "string",
+          "pattern": "^sha256:|^$"
+        }
+      }
+    },
+    "domain": {
+      "type": "string",
+      "description": "one of the 12 domain archetypes"
+    },
+    "task": {
+      "type": "object",
+      "required": [
+        "type",
+        "instruction",
+        "context",
+        "reference"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "nl2prisma",
+            "schema_edit",
+            "migration",
+            "crud",
+            "complex_read",
+            "nested_write",
+            "aggregation",
+            "repo_completion",
+            "bug_fix",
+            "cross_file",
+            "performance",
+            "security",
+            "nl_explain",
+            "qa",
+            "completion"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "description": "T1..T12 category id"
+        },
+        "difficulty": {
+          "enum": [
+            "L1",
+            "L2",
+            "L3",
+            "easy",
+            "medium",
+            "hard"
+          ]
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "instruction": {
+          "type": "string",
+          "minLength": 10
+        },
+        "context": {
+          "type": "object",
+          "required": [
+            "schema"
+          ],
+          "properties": {
+            "schema": {
+              "type": "string",
+              "description": "PSL context"
+            },
+            "dialect": {
+              "enum": [
+                "sqlite",
+                "postgres",
+                "postgresql",
+                "mysql"
+              ]
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "input": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string",
+          "description": "gold artifact; absent in public benchmark tasks"
+        },
+        "persona": {
+          "enum": [
+            "junior",
+            "pm",
+            "expert",
+            "none"
+          ]
+        },
+        "tests": {
+          "type": "object"
+        },
+        "destructive_risk": {
+          "type": "boolean"
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "verified",
+            "unverified",
+            "failed",
+            "pending"
+          ]
+        },
+        "gates": {
+          "type": "object"
+        },
+        "runtime_ms": {
+          "type": "number"
+        },
+        "verifier_version": {
+          "type": "string"
+        },
+        "error_class": {
+          "type": "string",
+          "pattern": "^E(10|[1-9])$|^$"
+        }
+      }
+    },
+    "difficulty_scores": {
+      "type": "object",
+      "properties": {
+        "models": {
+          "type": "integer"
+        },
+        "relations": {
+          "type": "integer"
+        },
+        "nesting": {
+          "type": "integer"
+        },
+        "ops": {
+          "type": "integer"
+        },
+        "ambiguity": {
+          "type": "integer"
+        }
+      }
+    },
+    "style_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "created": {
+          "type": "string"
+        },
+        "generator_version": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "canary": {
+          "type": "string"
+        }
+      }
+    },
+    "preference": {
+      "type": "object",
+      "description": "DPO pair block (chosen = reference, rejected = gate-failing)",
+      "properties": {
+        "chosen": {
+          "type": "string"
+        },
+        "rejected": {
+          "type": "string"
+        },
+        "basis": {
+          "type": "string"
+        }
+      }
+    },
+    "reasoning": {
+      "type": "object",
+      "description": "plan-span block (SFT auxiliary)",
+      "properties": {
+        "plan_span": {
+          "type": "string"
+        },
+        "artifact": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

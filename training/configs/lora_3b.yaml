@@ -1,0 +1,71 @@
+# PrismaCoder-3B - LoRA SFT (bf16 base, no quantization)
+# Ablation arm A2 vs QLoRA (report Part 12 ablation grid).
+run_name: prismacoder-3b-lora-sft
+output_dir: runs/prismacoder-3b-lora-sft
+seed: 20260830
+
+model:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  max_seq_length: 4096
+
+peft:
+  task_type: CAUSAL_LM
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  bias: none
+
+data:
+  train_file: datasets/train.jsonl
+  validation_file: datasets/validation.jsonl
+  prompt_column: task
+  format: chat
+  system_prompt: "You are PrismaCoder, an expert in the Prisma ORM. You write schema.prisma (PSL) and TypeScript Prisma Client code that compiles, validates, and executes correctly. Output only the requested artifact inside a fenced code block. Use Prisma v7 conventions."
+  packing: true
+  packing_strategy: wrapped
+  max_packed_seq_len: 4096
+  neftune_noise_alpha: 5
+  worker_count: 4
+
+training:
+  num_train_epochs: 3
+  learning_rate: 1.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+  optim: adamw_torch_fused
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 250
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 3
+  report_to: [tensorboard]
+  dataloader_num_workers: 4
+  group_by_length: true
+
+generation_sanity:
+  enabled: true
+  every_steps: 500
+  num_examples: 2
+  max_new_tokens: 512
+  temperature: 0.2
+
+hub:
+  push_to_hub: false
+  repo_id: prismacoder/PrismaCoder-3B-LoRA
+  private: true

@@ -1,0 +1,46 @@
+# accelerate config - multi-node DeepSpeed ZeRO-2 (S1/S2 at 8x A100)
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  gradient_accumulations: 1
+  gradient_clipping: 1.0
+  steps_per_print: 100
+  bf16:
+    enabled: true
+  zero_optimization:
+    stage: 2
+    offload_optimizer:
+      device: none
+    allgather_partitions: true
+    allgather_bucket_size: 500000000
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: 500000000
+    contiguous_gradients: true
+  optimizer:
+    type: AdamW
+    params:
+      lr: 1.5e-5
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      weight_decay: 0.01
+  scheduler:
+    type: WarmupDecayLR
+    params:
+      warmup_min_lr: 0
+      warmup_num_steps: 100
+      total_num_steps: 3000
+distributed_type: DEEPSPEED
+downcast_bf16: "no"
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

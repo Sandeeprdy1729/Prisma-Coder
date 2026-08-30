@@ -1,0 +1,91 @@
+# PrismaCoder-3B - QLoRA SFT (primary recipe, report Table 12.1 stage S1)
+# Base: Qwen/Qwen2.5-Coder-3B-Instruct (selection rationale: docs/BASE_MODEL.md)
+#
+# Hyperparameters follow the research spec: cosine schedule, 3% warmup, bf16,
+# 3 epochs over the 120k verified triples. QLoRA adaptation for single-GPU /
+# Kaggle T4 hardware: 4-bit nf4 base + LoRA r=16 alpha=32 on all linear
+# projections of the attention + MLP blocks.
+
+run_name: prismacoder-3b-qlora-sft
+output_dir: runs/prismacoder-3b-qlora-sft
+seed: 20260830
+
+# --- Model -------------------------------------------------------------------
+model:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2   # falls back to sdpa automatically when unavailable
+  quantization:                            # QLoRA (omit this block for LoRA/full)
+    load_in_4bit: true
+    bnb_4bit_quant_type: nf4
+    bnb_4bit_use_double_quant: true
+    bnb_4bit_compute_dtype: bfloat16
+
+tokenizer:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Instruct
+  max_seq_length: 4096
+
+# --- PEFT (also a valid PEFT LoraConfig shape) --------------------------------
+peft:
+  task_type: CAUSAL_LM
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  bias: none
+
+# --- Data ----------------------------------------------------------------------
+data:
+  train_file: datasets/train.jsonl
+  validation_file: datasets/validation.jsonl
+  prompt_column: task
+  # chat formatting: instruction+context -> user turn, reference -> assistant turn
+  format: chat
+  system_prompt: "You are PrismaCoder, an expert in the Prisma ORM. You write schema.prisma (PSL) and TypeScript Prisma Client code that compiles, validates, and executes correctly. Output only the requested artifact inside a fenced code block. Use Prisma v7 conventions."
+  packing: true
+  packing_strategy: wrapped            # SFT 'packing on' per Table 12.1
+  max_packed_seq_len: 4096
+  neftune_noise_alpha: 5               # Table 12.1: NEFTune alpha 5
+  mixture_soft_ordering: true          # epoch 1 oversamples L1, epoch 3 oversamples L3 (report 12.3)
+  worker_count: 4
+
+# --- Training hyperparameters (Table 12.1, S1 row) -------------------------------
+training:
+  num_train_epochs: 3
+  learning_rate: 1.0e-4                # LoRA/QLoRA LR; full FT uses 1.5e-5 (see full_ft.yaml)
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03                   # cosine with 3% warmup
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8       # effective global batch 128 seqs at 8-GPU scale
+  global_batch_size_target: 128        # documentation; resolved from the two lines above
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+  optim: paged_adamw_8bit
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 250
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 3
+  report_to: [tensorboard]
+  dataloader_num_workers: 4
+  group_by_length: true
+
+# --- Sanity-check generation during training --------------------------------------
+generation_sanity:
+  enabled: true
+  every_steps: 500
+  num_examples: 2
+  max_new_tokens: 512
+  temperature: 0.2
+
+# --- Hub ---------------------------------------------------------------------------
+hub:
+  push_to_hub: false
+  repo_id: prismacoder/PrismaCoder-3B-QLoRA
+  private: true

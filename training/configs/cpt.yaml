@@ -1,0 +1,59 @@
+# PrismaCoder-3B - Stage S0: continued pretraining (report Table 12.1)
+# Prisma-dense TS + schemas + docs; next-token; LR 8e-5 peak; global bs 4M
+# tokens; seq 8k avg; 1 epoch; 8-12B tokens total.
+run_name: prismacoder-3b-cpt
+output_dir: runs/prismacoder-3b-cpt
+seed: 20260830
+
+model:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Base
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  name_or_path: Qwen/Qwen2.5-Coder-3B-Base
+  max_seq_length: 8192
+
+data:
+  format: cpt                          # raw text packing; no chat template
+  train_file: datasets/processed/cpt_corpus.jsonl   # {text: ...} rows (docs+TS+PSL mix)
+  validation_file: datasets/processed/cpt_val.jsonl
+  mixture:                             # corpus mixture targets (report 12.1 S0)
+    mined_ts: 0.45
+    schemas_psl: 0.15
+    docs: 0.25
+    code_other: 0.15
+  packing: true
+  packing_strategy: wrapped
+  max_packed_seq_len: 8192
+  worker_count: 8
+
+training:
+  num_train_epochs: 1
+  learning_rate: 8.0e-5                # Table 12.1 S0 peak LR
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32
+  tokens_per_batch_target: 4000000     # 4M tokens / global step (bs 4M tok)
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+  optim: adamw_torch_fused
+  max_grad_norm: 1.0
+  weight_decay: 0.1
+  logging_steps: 20
+  eval_strategy: steps
+  eval_steps: 500
+  save_strategy: steps
+  save_steps: 2000
+  save_total_limit: 4
+  report_to: [tensorboard]
+  dataloader_num_workers: 8
+
+hub:
+  push_to_hub: false
+  repo_id: prismacoder/PrismaCoder-3B-CPT
+  private: true
