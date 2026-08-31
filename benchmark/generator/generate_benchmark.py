@@ -83,18 +83,38 @@ class BenchmarkBuilder:
         self.bug_injector = BugInjector(self.rng)
         self.light = LightValidator()
 
+    # cap on attempts per successful task before giving up on a slot, so a
+    # structurally-broken composer/gate combo fails loudly instead of hanging
+    MAX_ATTEMPTS_PER_TASK = 40
+
     def build(self) -> tuple[list[dict], list[dict], list[dict]]:
         plan = build_plan()
         tasks: list[dict] = []
         seq_per_cat: dict[str, int] = {}
+        shortfalls: dict[str, int] = {}
         for category_id, level, count in plan:
             n = max(1, round(count * self.scale))
-            for _ in range(n):
+            made = 0
+            attempts = 0
+            max_attempts = n * self.MAX_ATTEMPTS_PER_TASK
+            while made < n and attempts < max_attempts:
+                attempts += 1
                 seq = seq_per_cat.get(category_id, 0) + 1
-                seq_per_cat[category_id] = seq
                 task = self._make_task(category_id, level, bench_task_id(category_id.split("_")[0], seq))
                 if task:
+                    seq_per_cat[category_id] = seq
                     tasks.append(task)
+                    made += 1
+            if made < n:
+                key = f"{category_id}/{level}"
+                shortfalls[key] = n - made
+                log.warning(
+                    "gave up on %s after %d attempts: got %d/%d tasks "
+                    "(composer/gate pass rate too low for this slot)",
+                    key, attempts, made, n,
+                )
+        if shortfalls:
+            log.warning("build finished with shortfalls: %s", shortfalls)
         return self._split(tasks)
 
     # -- per-task construction ---------------------------------------------------
