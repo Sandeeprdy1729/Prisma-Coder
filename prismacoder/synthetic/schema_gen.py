@@ -119,6 +119,20 @@ class SampledSchema:
         def has_field(m: Model, name: str) -> bool:
             return any(f.name == name for f in m.fields)
 
+        def ensure_fk(m: Model, name: str, ftype: str, *, is_optional: bool = False) -> None:
+            """Create the FK scalar, or - if a same-named column already exists (tenant placeholder, domain field such as
+            companyId) - align its type/optionality with the referenced key. Reusing it unchanged produced FK type mismatches."""
+            f = next((x for x in m.fields if x.name == name), None)
+            if f is None:
+                m.fields.append(Field(name, ftype, is_optional=is_optional))
+                return
+            if f.is_relation:
+                return
+            f.type = ftype
+            f.is_optional = is_optional
+            f.is_list = False
+            f.attributes = [a for a in f.attributes if not a.startswith(("@default", "@db."))]
+
         def get_or_add(
             m: Model, name: str, ftype: str, *, is_list: bool = False, is_optional: bool = False
         ) -> Field:
@@ -146,14 +160,12 @@ class SampledSchema:
                     if key["kind"] == "composite":
                         for kname, ktype in key["fields"]:
                             fk_name = f"parent{_singular(sm.name)}_{kname}"
-                            if not has_field(sm, fk_name):
-                                sm.fields.append(Field(fk_name, ktype, is_optional=True))
+                            ensure_fk(sm, fk_name, ktype, is_optional=True)
                             fk_fields.append(fk_name)
                             ref_fields.append(kname)
                     else:
                         fk = f"parent{_singular(sm.name)}Id"
-                        if not has_field(sm, fk):
-                            sm.fields.append(Field(fk, key["scalar_type"], is_optional=True))
+                        ensure_fk(sm, fk, key["scalar_type"], is_optional=True)
                         fk_fields.append(fk)
                         ref_fields.append("id")
                     single = get_or_add(sm, rel.name, sm.name, is_optional=True)
@@ -179,8 +191,7 @@ class SampledSchema:
                         fk_fields = []
                         for kname, ktype in key["fields"]:
                             fk_name = f"{_snake(e.name)}_{kname}"
-                            if not has_field(child, fk_name):
-                                child.fields.append(Field(fk_name, ktype))
+                            ensure_fk(child, fk_name, ktype)
                             fk_fields.append(fk_name)
                         single_name = _camel_prop(e.name)
                         single = get_or_add(child, single_name, e.name)
@@ -192,8 +203,7 @@ class SampledSchema:
                         ]
                     else:
                         fk = f"{_snake(e.name)}Id"
-                        if not has_field(child, fk):
-                            child.fields.append(Field(fk, key["scalar_type"]))
+                        ensure_fk(child, fk, key["scalar_type"])
                         single_name = _camel_prop(e.name)
                         single = get_or_add(child, single_name, e.name)
                         single.is_optional = False
@@ -208,8 +218,7 @@ class SampledSchema:
                         fk_fields = []
                         for kname, ktype in key["fields"]:
                             fk_name = f"{_snake(e.name)}_{kname}"
-                            if not has_field(child, fk_name):
-                                child.fields.append(Field(fk_name, ktype, is_optional=True))
+                            ensure_fk(child, fk_name, ktype, is_optional=True)
                             fk_fields.append(fk_name)
                         single_name = _camel_prop(e.name)
                         single = get_or_add(child, single_name, e.name, is_optional=True)
@@ -221,8 +230,7 @@ class SampledSchema:
                         ]
                     else:
                         fk = f"{_snake(e.name)}Id"
-                        if not has_field(child, fk):
-                            child.fields.append(Field(fk, key["scalar_type"], is_optional=True))
+                        ensure_fk(child, fk, key["scalar_type"], is_optional=True)
                         single_name = _camel_prop(e.name)
                         single = get_or_add(child, single_name, e.name, is_optional=True)
                         single.is_optional = True
@@ -479,8 +487,8 @@ class PerturbationEngine:
         applied: list[str] = []
         for op in ops:
             fn = getattr(self, f"_op_{op}")
-            fn(models, sampled)
-            applied.append(op)
+            if fn(models, sampled):          # ops report whether they really changed the schema
+                applied.append(op)
         after_schema = SampledSchema(
             domain=sampled.domain,
             provider=sampled.provider,
@@ -524,90 +532,166 @@ class PerturbationEngine:
     def _rand_model(self, models: list[Model]) -> Model:
         return self.rng.choice(models)
 
-    def _op_add_field(self, models: list[Model], s: SampledSchema) -> None:
-        m = self._rand_model(models)
-        name = f"extraField{self.rng.randint(2, 99)}"
-        ftype = self.rng.choice(["String", "Int", "Boolean", "Float", "DateTime"])
-        f = Field(name, ftype, is_optional=self.rng.random() < 0.5)
-        m.fields.append(f)
+    # -- helpers shared by the ops: which scalars must stay as they are for the schema to remain valid ----
+    @staticmethod
+    def _protected(models: list[Model], m: Model) -> set[str]:
+        """Scalar fields of `m` that other constructs depend on (FK columns, referenced keys, index members)."""
+        keep: set[str] = set()
+        for f in m.relation_fields():                               # FK scalars used by this model's relations
+            for a in f.attributes:
+                mt = re.search(r"fields:\s*\[([^\]]*)\]", a)
+                if mt:
+                    keep |= {x.strip() for x in mt.group(1).split(",") if x.strip()}
+        for ba in m.block_attributes:                               # @@id / @@index / @@unique members
+            for mt in re.finditer(r"\[([^\]]*)\]", ba):
+                keep |= {x.strip().split("(")[0] for x in mt.group(1).split(",") if x.strip()}
+        for other in models:                                        # keys referenced by other models' relations
+            for f in other.relation_fields():
+                if f.type != m.name:
+                    continue
+                for a in f.attributes:
+                    mt = re.search(r"references:\s*\[([^\]]*)\]", a)
+                    if mt:
+                        keep |= {x.strip() for x in mt.group(1).split(",") if x.strip()}
+        return keep
 
-    def _op_remove_field(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_add_field(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
+        for _ in range(50):
+            name = f"extraField{self.rng.randint(2, 99)}"
+            if name not in m.field_names():
+                break
+        else:
+            return False
+        ftype = self.rng.choice(["String", "Int", "Boolean", "Float", "DateTime"])
+        m.fields.append(Field(name, ftype, is_optional=self.rng.random() < 0.5))
+        return True
+
+    def _op_remove_field(self, models: list[Model], s: SampledSchema) -> bool:
+        m = self._rand_model(models)
+        keep = self._protected(models, m)
         removable = [
             f
             for f in m.fields
-            if not f.is_relation and "@id" not in f.attributes and f.name not in ("createdAt", "updatedAt")
+            if not f.is_relation
+            and "@id" not in f.attributes
+            and f.name not in keep
+            and f.name not in ("createdAt", "updatedAt")
         ]
-        if removable:
-            m.fields.remove(self.rng.choice(removable))
+        if not removable:
+            return False
+        m.fields.remove(self.rng.choice(removable))
+        return True
 
-    def _op_retype_field(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_retype_field(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
-        scalars = m.scalar_fields()
-        if scalars:
-            f = self.rng.choice(scalars)
-            new_type = self.rng.choice([t for t in ("String", "Int", "Float", "Boolean") if t != f.type])
-            f.type = new_type
+        keep = self._protected(models, m)
+        # only plain scalars: no attributes (so no @default/@db.* that would stop matching the new type), not a key/FK
+        cands = [
+            f
+            for f in m.scalar_fields()
+            if not f.attributes and not f.is_list and f.type in ("String", "Int", "Float", "Boolean") and f.name not in keep
+        ]
+        if not cands:
+            return False
+        f = self.rng.choice(cands)
+        f.type = self.rng.choice([t for t in ("String", "Int", "Float", "Boolean") if t != f.type])
+        return True
 
-    def _op_toggle_optionality(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_toggle_optionality(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
-        if m.fields:
-            f = self.rng.choice(m.fields)
-            f.is_optional = not f.is_optional
+        keep = self._protected(models, m)
+        cands = [
+            f for f in m.scalar_fields() if "@id" not in f.attributes and not f.is_list and f.name not in keep
+        ]
+        if not cands:
+            return False
+        f = self.rng.choice(cands)
+        f.is_optional = not f.is_optional
+        return True
 
-    def _op_add_unique(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_add_unique(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
-        cands = [f for f in m.scalar_fields() if "@unique" not in f.attributes and "@id" not in f.attributes]
-        if cands:
-            self.rng.choice(cands).attributes.append("@unique")
+        cands = [
+            f
+            for f in m.scalar_fields()
+            if "@unique" not in f.attributes and "@id" not in f.attributes and not f.is_list
+        ]
+        if not cands:
+            return False
+        self.rng.choice(cands).attributes.append("@unique")
+        return True
 
-    def _op_add_index(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_add_index(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
-        cands = [f.name for f in m.scalar_fields()]
-        if cands:
-            m.block_attributes.append(f"@@index([{self.rng.choice(cands)}])")
+        cands = [f.name for f in m.scalar_fields() if f"@@index([{f.name}])" not in m.block_attributes and not f.is_list]
+        if not cands:
+            return False
+        m.block_attributes.append(f"@@index([{self.rng.choice(cands)}])")
+        return True
 
-    def _op_add_composite_unique(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_add_composite_unique(self, models: list[Model], s: SampledSchema) -> bool:
         m = self._rand_model(models)
-        cands = [f.name for f in m.scalar_fields() if "@id" not in f.attributes][:2]
-        if len(cands) >= 2:
-            m.block_attributes.append(f"@@unique([{cands[0]}, {cands[1]}])")
+        cands = [f.name for f in m.scalar_fields() if "@id" not in f.attributes and not f.is_list][:2]
+        if len(cands) < 2:
+            return False
+        attr = f"@@unique([{cands[0]}, {cands[1]}])"
+        if attr in m.block_attributes:
+            return False
+        m.block_attributes.append(attr)
+        return True
 
-    def _op_swap_key_style(self, models: list[Model], s: SampledSchema) -> None:
-        m = models[0]
-        new_style = self.rng.choice(["uuid", "cuid", "autoincrement"])
-        for f in m.fields:
-            if "@id" in f.attributes:
-                f.attributes.remove("@id")
-                f.attributes = [a for a in f.attributes if not a.startswith("@default")]
-                break
-        else:
-            return
-        if new_style == "autoincrement":
-            m.fields.insert(0, Field("id", "Int", attributes=["@id", "@default(autoincrement())"]))
-        elif new_style == "uuid":
-            m.fields.insert(0, Field("id", "String", attributes=["@id", "@default(uuid())"]))
-        else:
-            m.fields.insert(0, Field("id", "String", attributes=["@id", "@default(cuid())"]))
+    def _op_swap_key_style(self, models: list[Model], s: SampledSchema) -> bool:
+        if s.provider == "mongodb":                     # Mongo ids must stay @db.ObjectId / @map("_id")
+            return False
+        for m in models:
+            if any(ba.startswith("@@id") for ba in m.block_attributes):
+                continue                                # composite key
+            if any(f.type == m.name for o in models for f in o.relation_fields()):
+                continue                                # changing this id's type would break FK columns (other models or self-relations)
+            ids = [f for f in m.fields if "@id" in f.attributes]
+            if len(ids) != 1 or any(a.startswith("@db.") for a in ids[0].attributes):
+                continue
+            f = ids[0]
+            old = (f.type, next((a for a in f.attributes if a.startswith("@default")), None))
+            new_style = self.rng.choice(["uuid", "cuid", "autoincrement"])
+            new = ("Int", "@default(autoincrement())") if new_style == "autoincrement" else ("String", f"@default({new_style}())")
+            if new == old:
+                continue
+            f.type = new[0]
+            f.attributes = ["@id", new[1]]
+            return True
+        return False
 
-    def _op_add_enum_field(self, models: list[Model], s: SampledSchema) -> None:
+    def _op_add_enum_field(self, models: list[Model], s: SampledSchema) -> bool:
         if not s.enums:
-            return
+            return False
         m = self._rand_model(models)
         e = self.rng.choice(s.enums)
-        m.fields.append(
-            Field(
-                f"{_snake(e.name)}Ref",
-                e.name,
-                is_optional=True,
-                default=None if self.rng.random() < 0.5 else f'"{e.values[0]}"',
-            )
-        )
+        name = f"{_snake(e.name)}Ref"
+        if name in m.field_names():
+            return False
+        m.fields.append(Field(name, e.name, is_optional=True))
+        return True
 
-    def _op_change_cascade(self, models: list[Model], s: SampledSchema) -> None:
-        m = self._rand_model(models)
-        rels = m.relation_fields()
-        if rels:
-            f = self.rng.choice(rels)
-            f.attributes = [a for a in f.attributes if not a.startswith("@relation")]
-            f.attributes.append(f"@relation(onDelete: {self.rng.choice(['Cascade', 'SetNull', 'Restrict'])})")
+    def _op_change_cascade(self, models: list[Model], s: SampledSchema) -> bool:
+        # keep fields:/references: and only change onDelete (the old code replaced the whole @relation(...))
+        owning = [
+            (m, f, i)
+            for m in models
+            for f in m.relation_fields()
+            for i, a in enumerate(f.attributes)
+            if a.startswith("@relation(") and "fields:" in a
+        ]
+        if not owning:
+            return False
+        m, f, i = self.rng.choice(owning)
+        attr = f.attributes[i]
+        cur = re.search(r"onDelete:\s*(\w+)", attr)
+        options = ["Cascade", "Restrict"] + (["SetNull"] if f.is_optional else [])
+        options = [o for o in options if not cur or o != cur.group(1)]
+        if not options:
+            return False
+        base = re.sub(r",?\s*onDelete:\s*\w+", "", attr)
+        f.attributes[i] = base[:-1] + f", onDelete: {self.rng.choice(options)})"
+        return True
