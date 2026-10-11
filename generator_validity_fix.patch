@@ -1,0 +1,527 @@
+From 639ccfe4349f7cc1e0cc11d0a222c6efcb67ee01 Mon Sep 17 00:00:00 2001
+From: fix <fix@example.com>
+Date: Sun, 11 Oct 2026 03:31:28 +0000
+Subject: [PATCH] Generator: keep schemas valid (FK types, onDelete, ops),
+ report only applied ops; add validity gate
+
+---
+ benchmark/generator/audit_generator.py |  92 ++++++++++
+ prismacoder/edit_kinds.py              |  81 +++++++++
+ prismacoder/synthetic/schema_gen.py    | 242 +++++++++++++++++--------
+ 3 files changed, 336 insertions(+), 79 deletions(-)
+ create mode 100644 benchmark/generator/audit_generator.py
+ create mode 100644 prismacoder/edit_kinds.py
+
+diff --git a/benchmark/generator/audit_generator.py b/benchmark/generator/audit_generator.py
+new file mode 100644
+index 0000000..413ca0f
+--- /dev/null
++++ b/benchmark/generator/audit_generator.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""Generator health gate: every schema the generator emits must pass the REAL Prisma validator.
++
++    python benchmark/generator/audit_generator.py [--pairs 1000] [--max-invalid 0]
++
++Samples before/after schema pairs from the edit-task engine, validates both with the Prisma 7.10 schema engine
++(WASM build, installed on first use via npm), and checks that every operation named in a task is really present
++in its reference. Exit status 1 on any violation, so it can run in CI before a benchmark or dataset is built.
++"""
++from __future__ import annotations
++
++import argparse
++import collections
++import json
++import random
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++
++from prismacoder.edit_kinds import detect_kinds  # noqa: E402
++from prismacoder.synthetic.schema_gen import PerturbationEngine, SchemaSampler  # noqa: E402
++
++WASM = "@prisma/prisma-schema-wasm@7.10.0-4.0edf323efd1d98336f3f0a68684b56f689b900d3"  # engine of Prisma 7.10.0
++PV = r"""
++const w = require('@prisma/prisma-schema-wasm'); const fs = require('fs');
++const items = JSON.parse(fs.readFileSync(0, 'utf8'));
++process.stdout.write(JSON.stringify(items.map(it => { try { w.validate(JSON.stringify({prismaSchema: it.schema, noColor: true}));
++  return {key: it.key, valid: true, message: ''}; } catch (e) { let m = String((e && e.message) || e); try { m = JSON.parse(m).message || m; } catch (_) {}
++  return {key: it.key, valid: false, message: m}; } })));
++"""
++
++
++def validator_dir() -> Path:
++    d = Path(tempfile.gettempdir()) / "prismabench_validator"
++    if not (d / "node_modules" / "@prisma" / "prisma-schema-wasm").exists():
++        if not shutil.which("npm"):
++            sys.exit("npm/node (>=18) is required for the real-validator gate")
++        d.mkdir(exist_ok=True)
++        (d / "package.json").write_text('{"name":"pv","private":true}')
++        r = subprocess.run(["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", WASM], cwd=d, capture_output=True, text=True)
++        if r.returncode:
++            sys.exit("npm install failed:\n" + r.stderr[-500:])
++    (d / "pv.cjs").write_text(PV)
++    return d
++
++
++def validate(schemas: dict[str, str]) -> dict[str, dict]:
++    d, out = validator_dir(), {}
++    items = [{"key": k, "schema": v} for k, v in schemas.items()]
++    for i in range(0, len(items), 400):
++        r = subprocess.run(["node", "pv.cjs"], cwd=d, input=json.dumps(items[i:i + 400]), capture_output=True, text=True)
++        out.update({o["key"]: o for o in json.loads(r.stdout)})
++    return out
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--pairs", type=int, default=1000)
++    ap.add_argument("--max-invalid", type=int, default=0, help="tolerated invalid schemas (default 0)")
++    ap.add_argument("--min-ops-present", type=float, default=0.97, help="share of tasks whose listed ops are all in the reference")
++    a = ap.parse_args()
++
++    before, after, metas = {}, {}, {}
++    for seed in range(a.pairs):
++        rng = random.Random(seed)
++        b, af, meta = PerturbationEngine(rng).perturb(SchemaSampler(rng).sample())
++        before[str(seed)], after[str(seed)], metas[str(seed)] = b, af, meta
++    vb, va = validate(before), validate(after)
++    bad_b = [k for k, v in vb.items() if not v["valid"]]
++    bad_a = [k for k, v in va.items() if not v["valid"]]
++    present = sum(set(metas[k]["ops"]) <= detect_kinds(before[k], after[k]) for k in before)
++    ops_share = present / a.pairs
++
++    print(f"pairs sampled:                          {a.pairs}")
++    print(f"invalid BEFORE schemas (task context):  {len(bad_b)}")
++    print(f"invalid AFTER schemas (references):     {len(bad_a)}")
++    print(f"tasks whose listed ops are all present: {present}/{a.pairs} ({100 * ops_share:.1f}%)")
++    for label, bad, res in (("before", bad_b, vb), ("after", bad_a, va)):
++        for msg, n in collections.Counter(res[k]["message"].split("\n")[0][:100] for k in bad).most_common(5):
++            print(f"  [{label}] {n:4d}  {msg}")
++    ok = len(bad_b) + len(bad_a) <= a.max_invalid and ops_share >= a.min_ops_present
++    print("RESULT:", "PASS" if ok else "FAIL")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/prismacoder/edit_kinds.py b/prismacoder/edit_kinds.py
+new file mode 100644
+index 0000000..1b478b2
+--- /dev/null
++++ b/prismacoder/edit_kinds.py
+@@ -0,0 +1,81 @@
++"""Detect WHICH kinds of change separate two Prisma schemas (the T2 edit-task vocabulary).
++
++Used to check that a model's edited schema (or the generator's own reference) really contains the changes the prompt names.
++"""
++import re
++
++def parse_struct(schema):
++    """-> (models, enums). models: {name: {'fields': {fname: dict(type, base, optional, list, attrs)}, 'block': [str]}}"""
++    models, enums, cur, cur_kind = {}, {}, None, None
++    for line in schema.splitlines():
++        st = line.strip()
++        m = re.match(r"(model|enum|type)\s+(\w+)\s*\{", st)
++        if m:
++            cur_kind, cur = m.group(1), m.group(2)
++            if cur_kind == "model": models[cur] = {"fields": {}, "block": []}
++            elif cur_kind == "enum": enums[cur] = []
++            else: cur = None
++            continue
++        if cur and st.startswith("}"):
++            cur = cur_kind = None
++            continue
++        if not cur or not st or st.startswith("//"):
++            continue
++        if cur_kind == "enum":
++            enums[cur].append(st.split()[0]); continue
++        if st.startswith("@@"):
++            models[cur]["block"].append(re.sub(r"\s+", "", st)); continue
++        parts = st.split(None, 2)
++        if len(parts) < 2: continue
++        t = parts[1]
++        models[cur]["fields"][parts[0]] = {"type": t, "base": t.rstrip("?").replace("[]", ""), "optional": t.endswith("?"),
++                                           "list": t.endswith("[]"), "attrs": parts[2] if len(parts) > 2 else ""}
++    return models, enums
++
++def _count_block(models, prefix):
++    return sum(1 for m in models.values() for b in m["block"] if b.startswith(prefix))
++
++def _count_field_attr(models, attr):
++    return sum(1 for m in models.values() for f in m["fields"].values() if re.search(r"@unique\b", f["attrs"]))
++
++def _ondelete(models):
++    out = {}
++    for mn, m in models.items():
++        for fn, f in m["fields"].items():
++            x = re.search(r"onDelete:\s*(\w+)", f["attrs"])
++            if x: out[(mn, fn)] = x.group(1)
++    return out
++
++def _id_style(models):
++    out = {}
++    for mn, m in models.items():
++        for fn, f in m["fields"].items():
++            if "@id" in f["attrs"]:
++                d = re.search(r"@default\((\w+)", f["attrs"])
++                out[(mn, fn)] = (f["base"], d.group(1) if d else None)
++    return out
++
++def detect_kinds(before, after):
++    """Which kinds of change happened between two schemas? -> set of op names"""
++    a, ae = parse_struct(before); b, be = parse_struct(after)
++    got = set()
++    for mn in a:
++        if mn not in b: continue
++        fa, fb = a[mn]["fields"], b[mn]["fields"]
++        if set(fb) - set(fa): got.add("add_field")
++        if set(fa) - set(fb): got.add("remove_field")
++        for fn in set(fa) & set(fb):
++            if fa[fn]["base"] != fb[fn]["base"]: got.add("retype_field")
++            if fa[fn]["optional"] != fb[fn]["optional"]: got.add("toggle_optionality")
++    if _count_field_attr(b, "@unique") > _count_field_attr(a, "@unique"): got.add("add_unique")
++    if _count_block(b, "@@unique") > _count_block(a, "@@unique"): got.add("add_composite_unique")
++    if _count_block(b, "@@index") > _count_block(a, "@@index"): got.add("add_index")
++    if _id_style(a) != _id_style(b) and any(k in _id_style(b) for k in _id_style(a)): got.add("swap_key_style")
++    enum_names_b = set(be)
++    en = lambda ms, names: sum(1 for m in ms.values() for f in m["fields"].values() if f["base"] in names)
++    if en(b, enum_names_b) > en(a, set(ae)): got.add("add_enum_field")
++    if _ondelete(a) != _ondelete(b): got.add("change_cascade")
++    return got
++
++def kinds_ok(before, after, required):
++    return set(required) <= detect_kinds(before, after)
+diff --git a/prismacoder/synthetic/schema_gen.py b/prismacoder/synthetic/schema_gen.py
+index 76ac3ae..03bebf6 100644
+--- a/prismacoder/synthetic/schema_gen.py
++++ b/prismacoder/synthetic/schema_gen.py
+@@ -119,6 +119,20 @@ class SampledSchema:
+         def has_field(m: Model, name: str) -> bool:
+             return any(f.name == name for f in m.fields)
+ 
++        def ensure_fk(m: Model, name: str, ftype: str, *, is_optional: bool = False) -> None:
++            """Create the FK scalar, or - if a same-named column already exists (tenant placeholder, domain field such as
++            companyId) - align its type/optionality with the referenced key. Reusing it unchanged produced FK type mismatches."""
++            f = next((x for x in m.fields if x.name == name), None)
++            if f is None:
++                m.fields.append(Field(name, ftype, is_optional=is_optional))
++                return
++            if f.is_relation:
++                return
++            f.type = ftype
++            f.is_optional = is_optional
++            f.is_list = False
++            f.attributes = [a for a in f.attributes if not a.startswith(("@default", "@db."))]
++
+         def get_or_add(
+             m: Model, name: str, ftype: str, *, is_list: bool = False, is_optional: bool = False
+         ) -> Field:
+@@ -146,14 +160,12 @@ class SampledSchema:
+                     if key["kind"] == "composite":
+                         for kname, ktype in key["fields"]:
+                             fk_name = f"parent{_singular(sm.name)}_{kname}"
+-                            if not has_field(sm, fk_name):
+-                                sm.fields.append(Field(fk_name, ktype, is_optional=True))
++                            ensure_fk(sm, fk_name, ktype, is_optional=True)
+                             fk_fields.append(fk_name)
+                             ref_fields.append(kname)
+                     else:
+                         fk = f"parent{_singular(sm.name)}Id"
+-                        if not has_field(sm, fk):
+-                            sm.fields.append(Field(fk, key["scalar_type"], is_optional=True))
++                        ensure_fk(sm, fk, key["scalar_type"], is_optional=True)
+                         fk_fields.append(fk)
+                         ref_fields.append("id")
+                     single = get_or_add(sm, rel.name, sm.name, is_optional=True)
+@@ -179,8 +191,7 @@ class SampledSchema:
+                         fk_fields = []
+                         for kname, ktype in key["fields"]:
+                             fk_name = f"{_snake(e.name)}_{kname}"
+-                            if not has_field(child, fk_name):
+-                                child.fields.append(Field(fk_name, ktype))
++                            ensure_fk(child, fk_name, ktype)
+                             fk_fields.append(fk_name)
+                         single_name = _camel_prop(e.name)
+                         single = get_or_add(child, single_name, e.name)
+@@ -192,8 +203,7 @@ class SampledSchema:
+                         ]
+                     else:
+                         fk = f"{_snake(e.name)}Id"
+-                        if not has_field(child, fk):
+-                            child.fields.append(Field(fk, key["scalar_type"]))
++                        ensure_fk(child, fk, key["scalar_type"])
+                         single_name = _camel_prop(e.name)
+                         single = get_or_add(child, single_name, e.name)
+                         single.is_optional = False
+@@ -208,8 +218,7 @@ class SampledSchema:
+                         fk_fields = []
+                         for kname, ktype in key["fields"]:
+                             fk_name = f"{_snake(e.name)}_{kname}"
+-                            if not has_field(child, fk_name):
+-                                child.fields.append(Field(fk_name, ktype, is_optional=True))
++                            ensure_fk(child, fk_name, ktype, is_optional=True)
+                             fk_fields.append(fk_name)
+                         single_name = _camel_prop(e.name)
+                         single = get_or_add(child, single_name, e.name, is_optional=True)
+@@ -221,8 +230,7 @@ class SampledSchema:
+                         ]
+                     else:
+                         fk = f"{_snake(e.name)}Id"
+-                        if not has_field(child, fk):
+-                            child.fields.append(Field(fk, key["scalar_type"], is_optional=True))
++                        ensure_fk(child, fk, key["scalar_type"], is_optional=True)
+                         single_name = _camel_prop(e.name)
+                         single = get_or_add(child, single_name, e.name, is_optional=True)
+                         single.is_optional = True
+@@ -479,8 +487,8 @@ class PerturbationEngine:
+         applied: list[str] = []
+         for op in ops:
+             fn = getattr(self, f"_op_{op}")
+-            fn(models, sampled)
+-            applied.append(op)
++            if fn(models, sampled):          # ops report whether they really changed the schema
++                applied.append(op)
+         after_schema = SampledSchema(
+             domain=sampled.domain,
+             provider=sampled.provider,
+@@ -524,90 +532,166 @@ class PerturbationEngine:
+     def _rand_model(self, models: list[Model]) -> Model:
+         return self.rng.choice(models)
+ 
+-    def _op_add_field(self, models: list[Model], s: SampledSchema) -> None:
++    # -- helpers shared by the ops: which scalars must stay as they are for the schema to remain valid ----
++    @staticmethod
++    def _protected(models: list[Model], m: Model) -> set[str]:
++        """Scalar fields of `m` that other constructs depend on (FK columns, referenced keys, index members)."""
++        keep: set[str] = set()
++        for f in m.relation_fields():                               # FK scalars used by this model's relations
++            for a in f.attributes:
++                mt = re.search(r"fields:\s*\[([^\]]*)\]", a)
++                if mt:
++                    keep |= {x.strip() for x in mt.group(1).split(",") if x.strip()}
++        for ba in m.block_attributes:                               # @@id / @@index / @@unique members
++            for mt in re.finditer(r"\[([^\]]*)\]", ba):
++                keep |= {x.strip().split("(")[0] for x in mt.group(1).split(",") if x.strip()}
++        for other in models:                                        # keys referenced by other models' relations
++            for f in other.relation_fields():
++                if f.type != m.name:
++                    continue
++                for a in f.attributes:
++                    mt = re.search(r"references:\s*\[([^\]]*)\]", a)
++                    if mt:
++                        keep |= {x.strip() for x in mt.group(1).split(",") if x.strip()}
++        return keep
++
++    def _op_add_field(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        name = f"extraField{self.rng.randint(2, 99)}"
++        for _ in range(50):
++            name = f"extraField{self.rng.randint(2, 99)}"
++            if name not in m.field_names():
++                break
++        else:
++            return False
+         ftype = self.rng.choice(["String", "Int", "Boolean", "Float", "DateTime"])
+-        f = Field(name, ftype, is_optional=self.rng.random() < 0.5)
+-        m.fields.append(f)
++        m.fields.append(Field(name, ftype, is_optional=self.rng.random() < 0.5))
++        return True
+ 
+-    def _op_remove_field(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_remove_field(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
++        keep = self._protected(models, m)
+         removable = [
+             f
+             for f in m.fields
+-            if not f.is_relation and "@id" not in f.attributes and f.name not in ("createdAt", "updatedAt")
++            if not f.is_relation
++            and "@id" not in f.attributes
++            and f.name not in keep
++            and f.name not in ("createdAt", "updatedAt")
+         ]
+-        if removable:
+-            m.fields.remove(self.rng.choice(removable))
++        if not removable:
++            return False
++        m.fields.remove(self.rng.choice(removable))
++        return True
+ 
+-    def _op_retype_field(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_retype_field(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        scalars = m.scalar_fields()
+-        if scalars:
+-            f = self.rng.choice(scalars)
+-            new_type = self.rng.choice([t for t in ("String", "Int", "Float", "Boolean") if t != f.type])
+-            f.type = new_type
++        keep = self._protected(models, m)
++        # only plain scalars: no attributes (so no @default/@db.* that would stop matching the new type), not a key/FK
++        cands = [
++            f
++            for f in m.scalar_fields()
++            if not f.attributes and not f.is_list and f.type in ("String", "Int", "Float", "Boolean") and f.name not in keep
++        ]
++        if not cands:
++            return False
++        f = self.rng.choice(cands)
++        f.type = self.rng.choice([t for t in ("String", "Int", "Float", "Boolean") if t != f.type])
++        return True
+ 
+-    def _op_toggle_optionality(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_toggle_optionality(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        if m.fields:
+-            f = self.rng.choice(m.fields)
+-            f.is_optional = not f.is_optional
++        keep = self._protected(models, m)
++        cands = [
++            f for f in m.scalar_fields() if "@id" not in f.attributes and not f.is_list and f.name not in keep
++        ]
++        if not cands:
++            return False
++        f = self.rng.choice(cands)
++        f.is_optional = not f.is_optional
++        return True
+ 
+-    def _op_add_unique(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_add_unique(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        cands = [f for f in m.scalar_fields() if "@unique" not in f.attributes and "@id" not in f.attributes]
+-        if cands:
+-            self.rng.choice(cands).attributes.append("@unique")
++        cands = [
++            f
++            for f in m.scalar_fields()
++            if "@unique" not in f.attributes and "@id" not in f.attributes and not f.is_list
++        ]
++        if not cands:
++            return False
++        self.rng.choice(cands).attributes.append("@unique")
++        return True
+ 
+-    def _op_add_index(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_add_index(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        cands = [f.name for f in m.scalar_fields()]
+-        if cands:
+-            m.block_attributes.append(f"@@index([{self.rng.choice(cands)}])")
++        cands = [f.name for f in m.scalar_fields() if f"@@index([{f.name}])" not in m.block_attributes and not f.is_list]
++        if not cands:
++            return False
++        m.block_attributes.append(f"@@index([{self.rng.choice(cands)}])")
++        return True
+ 
+-    def _op_add_composite_unique(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_add_composite_unique(self, models: list[Model], s: SampledSchema) -> bool:
+         m = self._rand_model(models)
+-        cands = [f.name for f in m.scalar_fields() if "@id" not in f.attributes][:2]
+-        if len(cands) >= 2:
+-            m.block_attributes.append(f"@@unique([{cands[0]}, {cands[1]}])")
+-
+-    def _op_swap_key_style(self, models: list[Model], s: SampledSchema) -> None:
+-        m = models[0]
+-        new_style = self.rng.choice(["uuid", "cuid", "autoincrement"])
+-        for f in m.fields:
+-            if "@id" in f.attributes:
+-                f.attributes.remove("@id")
+-                f.attributes = [a for a in f.attributes if not a.startswith("@default")]
+-                break
+-        else:
+-            return
+-        if new_style == "autoincrement":
+-            m.fields.insert(0, Field("id", "Int", attributes=["@id", "@default(autoincrement())"]))
+-        elif new_style == "uuid":
+-            m.fields.insert(0, Field("id", "String", attributes=["@id", "@default(uuid())"]))
+-        else:
+-            m.fields.insert(0, Field("id", "String", attributes=["@id", "@default(cuid())"]))
++        cands = [f.name for f in m.scalar_fields() if "@id" not in f.attributes and not f.is_list][:2]
++        if len(cands) < 2:
++            return False
++        attr = f"@@unique([{cands[0]}, {cands[1]}])"
++        if attr in m.block_attributes:
++            return False
++        m.block_attributes.append(attr)
++        return True
++
++    def _op_swap_key_style(self, models: list[Model], s: SampledSchema) -> bool:
++        if s.provider == "mongodb":                     # Mongo ids must stay @db.ObjectId / @map("_id")
++            return False
++        for m in models:
++            if any(ba.startswith("@@id") for ba in m.block_attributes):
++                continue                                # composite key
++            if any(f.type == m.name for o in models for f in o.relation_fields()):
++                continue                                # changing this id's type would break FK columns (other models or self-relations)
++            ids = [f for f in m.fields if "@id" in f.attributes]
++            if len(ids) != 1 or any(a.startswith("@db.") for a in ids[0].attributes):
++                continue
++            f = ids[0]
++            old = (f.type, next((a for a in f.attributes if a.startswith("@default")), None))
++            new_style = self.rng.choice(["uuid", "cuid", "autoincrement"])
++            new = ("Int", "@default(autoincrement())") if new_style == "autoincrement" else ("String", f"@default({new_style}())")
++            if new == old:
++                continue
++            f.type = new[0]
++            f.attributes = ["@id", new[1]]
++            return True
++        return False
+ 
+-    def _op_add_enum_field(self, models: list[Model], s: SampledSchema) -> None:
++    def _op_add_enum_field(self, models: list[Model], s: SampledSchema) -> bool:
+         if not s.enums:
+-            return
++            return False
+         m = self._rand_model(models)
+         e = self.rng.choice(s.enums)
+-        m.fields.append(
+-            Field(
+-                f"{_snake(e.name)}Ref",
+-                e.name,
+-                is_optional=True,
+-                default=None if self.rng.random() < 0.5 else f'"{e.values[0]}"',
+-            )
+-        )
+-
+-    def _op_change_cascade(self, models: list[Model], s: SampledSchema) -> None:
+-        m = self._rand_model(models)
+-        rels = m.relation_fields()
+-        if rels:
+-            f = self.rng.choice(rels)
+-            f.attributes = [a for a in f.attributes if not a.startswith("@relation")]
+-            f.attributes.append(f"@relation(onDelete: {self.rng.choice(['Cascade', 'SetNull', 'Restrict'])})")
++        name = f"{_snake(e.name)}Ref"
++        if name in m.field_names():
++            return False
++        m.fields.append(Field(name, e.name, is_optional=True))
++        return True
++
++    def _op_change_cascade(self, models: list[Model], s: SampledSchema) -> bool:
++        # keep fields:/references: and only change onDelete (the old code replaced the whole @relation(...))
++        owning = [
++            (m, f, i)
++            for m in models
++            for f in m.relation_fields()
++            for i, a in enumerate(f.attributes)
++            if a.startswith("@relation(") and "fields:" in a
++        ]
++        if not owning:
++            return False
++        m, f, i = self.rng.choice(owning)
++        attr = f.attributes[i]
++        cur = re.search(r"onDelete:\s*(\w+)", attr)
++        options = ["Cascade", "Restrict"] + (["SetNull"] if f.is_optional else [])
++        options = [o for o in options if not cur or o != cur.group(1)]
++        if not options:
++            return False
++        base = re.sub(r",?\s*onDelete:\s*\w+", "", attr)
++        f.attributes[i] = base[:-1] + f", onDelete: {self.rng.choice(options)})"
++        return True
+-- 
+2.43.0
+
